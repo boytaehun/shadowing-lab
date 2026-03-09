@@ -40,7 +40,7 @@ function fmtTime(t) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function detectSentences(audioBuffer, threshold, minSil) {
+function detectSentences(audioBuffer, sensitivity, minSil) {
   const sr = audioBuffer.sampleRate;
   const nCh = audioBuffer.numberOfChannels;
   const len = audioBuffer.length;
@@ -50,17 +50,39 @@ function detectSentences(audioBuffer, threshold, minSil) {
     for (let i = 0; i < len; i++) mono[i] += ch[i] / nCh;
   }
   const winSize = Math.floor(sr * 0.04);
+  const numWins = Math.ceil(len / winSize);
+  const rmsArr = new Float32Array(numWins);
+
+  // Pass 1: compute RMS per window
+  for (let w = 0; w < numWins; w++) {
+    const start = w * winSize;
+    const end = Math.min(start + winSize, len);
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += mono[j] * mono[j];
+    rmsArr[w] = Math.sqrt(sum / (end - start));
+  }
+
+  // Compute percentiles for adaptive threshold
+  const sorted = Float32Array.from(rmsArr).sort();
+  const pct = (p) => sorted[Math.min(Math.floor(sorted.length * p), sorted.length - 1)];
+  const noiseFloor = pct(0.15);  // bottom 15% = background noise level
+  const speechLevel = pct(0.85); // top 15% = speech level
+  const range = speechLevel - noiseFloor;
+
+  // sensitivity (0~1): 0 = only cut at absolute silence, 1 = cut at any small dip
+  // cutoff sits between noise floor and speech level
+  const cutoff = range > 0.0001
+    ? noiseFloor + range * (1.0 - sensitivity)
+    : noiseFloor * (2.0 - sensitivity);
+
+  // Pass 2: detect segments using adaptive cutoff
   const segs = [];
   let inSpeech = false;
   let silStart = 0;
   let segStart = -1;
-  for (let i = 0; i < len; i += winSize) {
-    const end = Math.min(i + winSize, len);
-    let sum = 0;
-    for (let j = i; j < end; j++) sum += mono[j] * mono[j];
-    const rms = Math.sqrt(sum / (end - i));
-    const t = i / sr;
-    if (rms >= threshold) {
+  for (let w = 0; w < numWins; w++) {
+    const t = (w * winSize) / sr;
+    if (rmsArr[w] >= cutoff) {
       if (!inSpeech) {
         if (segStart < 0) { segStart = t; }
         else {
@@ -79,6 +101,7 @@ function detectSentences(audioBuffer, threshold, minSil) {
   const total = len / sr;
   if (segStart >= 0 && total - segStart > 0.1)
     segs.push({ start: segStart, end: total });
+  // Merge segments shorter than 1s into previous
   const merged = [];
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i];
@@ -197,7 +220,7 @@ function App() {
   const [speed, setSpeed] = useState(_initGlobal.speed || 1.0);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [threshold, setThreshold] = useState(_initGlobal.threshold || 0.018);
+  const [threshold, setThreshold] = useState(_initGlobal.threshold !== undefined ? _initGlobal.threshold : 0.5);
   const [minSilDur, setMinSilDur] = useState(_initGlobal.minSilDur || 0.2);
   const [ytInput, setYtInput] = useState("");
   const [ytId, setYtId] = useState("");
@@ -725,9 +748,9 @@ function App() {
 
           {showSettings && (
             <div style={{ background:C.card, borderRadius:10, padding:"14px", marginTop:6, border:`1px solid ${C.border}` }}>
-              <SliderRow label="무음 감지 임계값" sub="높이면 더 많이 분리"
-                value={threshold} min={0.003} max={0.1} step={0.002}
-                onChange={setThreshold} fmt={v=>v.toFixed(3)} />
+              <SliderRow label="분리 감도" sub="높이면 소음 속에서도 잘 끊김"
+                value={threshold} min={0.0} max={1.0} step={0.05}
+                onChange={setThreshold} fmt={v=>Math.round(v*100)+"%"} />
               <SliderRow label="최소 무음 길이" sub="짧을수록 더 자주 분리"
                 value={minSilDur} min={0.1} max={2.0} step={0.05}
                 onChange={setMinSilDur} fmt={v=>v.toFixed(2)+"초"} />
