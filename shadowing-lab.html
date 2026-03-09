@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Shadowing Lab">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f5f3ef">
+<title>Shadowing Lab</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body, #root { height: 100%; width: 100%; overflow: hidden; }
+  body { font-family: -apple-system, 'Apple SD Gothic Neo', 'Pretendard', 'Noto Sans KR', sans-serif; background: #f5f3ef; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #f5f3ef; }
+  ::-webkit-scrollbar-thumb { background: #e2ddd6; border-radius: 2px; }
+  button:active { opacity: 0.7 !important; transform: scale(0.97); }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
+  input[type="range"] { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 99px; outline: none; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #e8500a; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+const SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+function fmtTime(t) {
+  if (!t || isNaN(t)) return "0:00";
+  const m = Math.floor(t / 60);
+  const s = Math.floor(t % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function detectSentences(audioBuffer, threshold, minSil) {
+  const sr = audioBuffer.sampleRate;
+  const nCh = audioBuffer.numberOfChannels;
+  const len = audioBuffer.length;
+  const mono = new Float32Array(len);
+  for (let c = 0; c < nCh; c++) {
+    const ch = audioBuffer.getChannelData(c);
+    for (let i = 0; i < len; i++) mono[i] += ch[i] / nCh;
+  }
+  const winSize = Math.floor(sr * 0.04);
+  const segs = [];
+  let inSpeech = false;
+  let silStart = 0;
+  let segStart = -1;
+  for (let i = 0; i < len; i += winSize) {
+    const end = Math.min(i + winSize, len);
+    let sum = 0;
+    for (let j = i; j < end; j++) sum += mono[j] * mono[j];
+    const rms = Math.sqrt(sum / (end - i));
+    const t = i / sr;
+    if (rms >= threshold) {
+      if (!inSpeech) {
+        if (segStart < 0) { segStart = t; }
+        else {
+          const silDur = t - silStart;
+          if (silDur >= minSil && silStart - segStart > 0.05) {
+            segs.push({ start: segStart, end: silStart + 0.05 });
+            segStart = t;
+          }
+        }
+        inSpeech = true;
+      }
+    } else {
+      if (inSpeech) { silStart = t; inSpeech = false; }
+    }
+  }
+  const total = len / sr;
+  if (segStart >= 0 && total - segStart > 0.1)
+    segs.push({ start: segStart, end: total });
+  const merged = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s.end - s.start < 1.0 && merged.length > 0) {
+      merged[merged.length - 1].end = s.end;
+    } else {
+      merged.push({ start: s.start, end: s.end });
+    }
+  }
+  return merged;
+}
+
+const C = {
+  bg: "#f5f3ef", card: "#ffffff", border: "#e2ddd6",
+  accent: "#e8500a", accent2: "#2563eb", accentLight: "#fde8de",
+  text: "#1a1612", muted: "#7a6e65", dim: "#ede9e4",
+  green: "#16a34a", greenLight: "#dcfce7",
+};
+
+class AudioPlayer {
+  constructor() {
+    this.ctx = null; this.source = null; this.gainNode = null;
+    this.buffer = null; this.startedAt = 0; this.offsetAt = 0;
+    this.speed = 1.0; this.playing = false;
+    this.onTimeUpdate = null; this.rafId = null;
+    this.segEnd = null; this.onSegEnd = null;
+  }
+  async ensureCtx() {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.gainNode = this.ctx.createGain();
+      this.gainNode.connect(this.ctx.destination);
+    }
+    if (this.ctx.state === "suspended") await this.ctx.resume();
+  }
+  get currentTime() {
+    if (!this.playing || !this.ctx) return this.offsetAt;
+    return this.offsetAt + (this.ctx.currentTime - this.startedAt) * this.speed;
+  }
+  get duration() { return this.buffer ? this.buffer.duration : 0; }
+  stopSource() {
+    this.playing = false;
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+    if (this.source) {
+      this.source.onended = null;
+      try { this.source.stop(); } catch (_) {}
+      this.source.disconnect();
+      this.source = null;
+    }
+  }
+  async play(offset, segEnd, speed = 1.0) {
+    await this.ensureCtx(); this.stopSource();
+    if (!this.buffer) return;
+    const safeOffset = Math.max(0, Math.min(offset, this.buffer.duration - 0.01));
+    this.offsetAt = safeOffset; this.startedAt = this.ctx.currentTime;
+    this.speed = speed; this.segEnd = segEnd;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.buffer; src.playbackRate.value = speed;
+    src.connect(this.gainNode);
+    src.start(0, safeOffset, (this.buffer.duration - safeOffset) / speed);
+    this.source = src; this.playing = true;
+    src.onended = () => { if (this.playing) { this.playing = false; if (this.onSegEnd) this.onSegEnd("ended"); } };
+    const tick = () => {
+      if (!this.playing) return;
+      const ct = this.currentTime;
+      if (this.onTimeUpdate) this.onTimeUpdate(ct);
+      if (this.segEnd !== null && ct >= this.segEnd - 0.06) {
+        this.playing = false;
+        if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+        if (this.source) {
+          this.source.onended = null;
+          try { this.source.stop(); } catch (_) {}
+          this.source.disconnect();
+          this.source = null;
+        }
+        this.offsetAt = this.segEnd;
+        if (this.onSegEnd) this.onSegEnd("segend");
+        return;
+      }
+      this.rafId = requestAnimationFrame(tick);
+    };
+    this.rafId = requestAnimationFrame(tick);
+  }
+  pause() { if (!this.playing) return; this.offsetAt = this.currentTime; this.stopSource(); }
+  seek(t) { this.offsetAt = Math.max(0, Math.min(t, this.duration)); }
+  setBuffer(buf) { this.stopSource(); this.buffer = buf; this.offsetAt = 0; }
+}
+
+// ── LocalStorage helpers ──
+const STORE_PREFIX = "slab_";
+const STORE_GLOBAL = STORE_PREFIX + "global";
+const STORE_FILES = STORE_PREFIX + "files"; // list of known filenames
+
+function saveGlobal(data) {
+  try { localStorage.setItem(STORE_GLOBAL, JSON.stringify(data)); } catch(_) {}
+}
+function loadGlobal() {
+  try { const d = localStorage.getItem(STORE_GLOBAL); return d ? JSON.parse(d) : null; } catch(_) { return null; }
+}
+function fileKey(name) { return STORE_PREFIX + "f_" + name; }
+function saveFileProgress(name, data) {
+  try {
+    localStorage.setItem(fileKey(name), JSON.stringify({ ...data, updatedAt: Date.now() }));
+    // update file list
+    const list = loadFileList();
+    const existing = list.findIndex(f => f.name === name);
+    const entry = { name, updatedAt: Date.now() };
+    if (existing >= 0) list[existing] = entry; else list.unshift(entry);
+    localStorage.setItem(STORE_FILES, JSON.stringify(list.slice(0, 50)));
+  } catch(_) {}
+}
+function loadFileProgress(name) {
+  try { const d = localStorage.getItem(fileKey(name)); return d ? JSON.parse(d) : null; } catch(_) { return null; }
+}
+function loadFileList() {
+  try { const d = localStorage.getItem(STORE_FILES); return d ? JSON.parse(d) : []; } catch(_) { return []; }
+}
+function removeFileProgress(name) {
+  try {
+    localStorage.removeItem(fileKey(name));
+    const list = loadFileList().filter(f => f.name !== name);
+    localStorage.setItem(STORE_FILES, JSON.stringify(list));
+  } catch(_) {}
+}
+
+const _initGlobal = loadGlobal() || {};
+
+function App() {
+  const [tab, setTab] = useState("file");
+  const [fileName, setFileName] = useState("");
+  const [status, setStatus] = useState("idle");
+  const [errMsg, setErrMsg] = useState("");
+  const [sentences, setSentences] = useState([]);
+  const [curIdx, setCurIdx] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLooping, setIsLooping] = useState(_initGlobal.isLooping !== undefined ? _initGlobal.isLooping : true);
+  const [repeatCount, setRepeatCount] = useState(_initGlobal.repeatCount || 3);
+  const [speed, setSpeed] = useState(_initGlobal.speed || 1.0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [threshold, setThreshold] = useState(_initGlobal.threshold || 0.018);
+  const [minSilDur, setMinSilDur] = useState(_initGlobal.minSilDur || 0.2);
+  const [ytInput, setYtInput] = useState("");
+  const [ytId, setYtId] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [repeatRem, setRepeatRem] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const [pauseDur, setPauseDur] = useState(_initGlobal.pauseDur || 0);
+  const [isPausing, setIsPausing] = useState(false);
+  const [disabledSet, setDisabledSet] = useState(new Set());
+  const [savedFiles, setSavedFiles] = useState(loadFileList());
+  const [hasRestoredFile, setHasRestoredFile] = useState(false);
+
+  const playerRef = useRef(new AudioPlayer());
+  const sentListRef = useRef(null);
+  const audioBufRef = useRef(null);
+  const segsRef = useRef([]);
+  const idxRef = useRef(0);
+  const loopRef = useRef(true);
+  const repCountRef = useRef(3);
+  const repRemRef = useRef(0);
+  const speedRef = useRef(1.0);
+  const pauseDurRef = useRef(0);
+  const pauseTimerRef = useRef(null);
+  const disabledRef = useRef(new Set());
+  const fileNameRef = useRef("");
+
+  useEffect(() => { segsRef.current = sentences; }, [sentences]);
+  useEffect(() => { idxRef.current = curIdx; }, [curIdx]);
+  useEffect(() => { loopRef.current = isLooping; }, [isLooping]);
+  useEffect(() => { repCountRef.current = repeatCount; }, [repeatCount]);
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { pauseDurRef.current = pauseDur; }, [pauseDur]);
+  useEffect(() => { disabledRef.current = disabledSet; }, [disabledSet]);
+
+  // ── Auto-save global settings ──
+  useEffect(() => {
+    saveGlobal({ isLooping, repeatCount, speed, pauseDur, threshold, minSilDur });
+  }, [isLooping, repeatCount, speed, pauseDur, threshold, minSilDur]);
+
+  // ── Auto-save per-file progress ──
+  useEffect(() => {
+    if (!fileNameRef.current || sentences.length === 0) return;
+    const timer = setTimeout(() => {
+      saveFileProgress(fileNameRef.current, {
+        disabledIdxs: [...disabledRef.current],
+        curIdx: idxRef.current,
+        segCount: segsRef.current.length,
+      });
+      setSavedFiles(loadFileList());
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [disabledSet, curIdx, sentences]);
+
+  useEffect(() => {
+    const player = playerRef.current;
+    player.onTimeUpdate = (t) => setCurrentTime(t);
+    player.onSegEnd = (reason) => {
+      const segs = segsRef.current; const idx = idxRef.current;
+      const disabled = disabledRef.current;
+      const findNextEnabled = (from) => {
+        for (let i = from; i < segs.length; i++) { if (!disabled.has(i)) return i; }
+        return -1;
+      };
+      const delayPlay = (fn) => {
+        const pd = pauseDurRef.current;
+        if (pd > 0) {
+          setIsPausing(true);
+          pauseTimerRef.current = setTimeout(() => { pauseTimerRef.current = null; setIsPausing(false); fn(); }, pd * 1000);
+        } else { fn(); }
+      };
+      if (reason === "segend") {
+        if (loopRef.current && repRemRef.current > 1) {
+          repRemRef.current -= 1; setRepeatRem(repRemRef.current);
+          delayPlay(() => player.play(segs[idx].start, segs[idx].end, speedRef.current));
+        } else {
+          const next = findNextEnabled(idx + 1);
+          if (next >= 0) {
+            idxRef.current = next; setCurIdx(next);
+            repRemRef.current = repCountRef.current; setRepeatRem(repCountRef.current);
+            delayPlay(() => {
+              player.play(segs[next].start, segs[next].end, speedRef.current);
+              setTimeout(() => sentListRef.current?.children[next]?.scrollIntoView({ block: "nearest", behavior: "smooth" }), 30);
+            });
+          } else { setIsPlaying(false); setRepeatRem(0); }
+        }
+      } else { setIsPlaying(false); setRepeatRem(0); }
+    };
+  }, []);
+
+  const runAnalysis = useCallback((buf, thr, minSil, fName) => {
+    const segs = detectSentences(buf, thr, minSil);
+    setSentences(segs); segsRef.current = segs;
+    // Try restoring saved progress
+    const saved = fName ? loadFileProgress(fName) : null;
+    if (saved && saved.segCount === segs.length) {
+      const restoredDisabled = new Set(saved.disabledIdxs || []);
+      setDisabledSet(restoredDisabled); disabledRef.current = restoredDisabled;
+      const idx = Math.min(saved.curIdx || 0, segs.length - 1);
+      setCurIdx(idx); idxRef.current = idx;
+      setHasRestoredFile(true);
+      setTimeout(() => setHasRestoredFile(false), 3000);
+    } else {
+      setCurIdx(0); idxRef.current = 0;
+      setDisabledSet(new Set()); disabledRef.current = new Set();
+    }
+    if (segs.length > 0) { setStatus("ready"); setCurrentTime(0); }
+    else { setStatus("error"); setErrMsg("구간을 감지하지 못했습니다. 임계값을 높여 재분석해 보세요."); }
+  }, []);
+
+  const handleFile = useCallback(async (file) => {
+    if (!file) return;
+    fileNameRef.current = file.name;
+    setFileName(file.name); setStatus("loading"); setErrMsg("");
+    setSentences([]); segsRef.current = []; setCurIdx(0); idxRef.current = 0;
+    setIsPlaying(false); setCurrentTime(0); setDuration(0); setRepeatRem(0);
+    setIsPausing(false);
+    if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; }
+    playerRef.current.stopSource();
+    try {
+      await playerRef.current.ensureCtx();
+      const ctx = playerRef.current.ctx;
+      setStatus("analyzing");
+      const arrayBuf = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result);
+        reader.onerror = () => reject(new Error("파일 읽기 실패"));
+        reader.readAsArrayBuffer(file);
+      });
+      const buf = await ctx.decodeAudioData(arrayBuf);
+      audioBufRef.current = buf; playerRef.current.setBuffer(buf);
+      setDuration(buf.duration); runAnalysis(buf, threshold, minSilDur, file.name);
+    } catch (err) {
+      setStatus("error"); setErrMsg("파일 분석 실패: " + (err.message || "지원하지 않는 형식"));
+    }
+  }, [threshold, minSilDur, runAnalysis]);
+
+  const reAnalyze = useCallback(() => {
+    if (!audioBufRef.current) return;
+    playerRef.current.stopSource(); setIsPlaying(false); setStatus("analyzing");
+    setTimeout(() => runAnalysis(audioBufRef.current, threshold, minSilDur, fileNameRef.current), 30);
+  }, [threshold, minSilDur, runAnalysis]);
+
+  const playSeg = useCallback(async (idx) => {
+    const segs = segsRef.current; if (!segs[idx]) return;
+    if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; setIsPausing(false); }
+    idxRef.current = idx; setCurIdx(idx);
+    repRemRef.current = repCountRef.current; setRepeatRem(repCountRef.current);
+    await playerRef.current.play(segs[idx].start, segs[idx].end, speedRef.current);
+    setIsPlaying(true);
+    setTimeout(() => sentListRef.current?.children[idx]?.scrollIntoView({ block: "nearest", behavior: "smooth" }), 30);
+  }, []);
+
+  const togglePlay = useCallback(async () => {
+    if (isPlaying || isPausing) {
+      if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; setIsPausing(false); }
+      playerRef.current.pause(); setIsPlaying(false);
+    }
+    else if (segsRef.current.length > 0) await playSeg(idxRef.current);
+  }, [isPlaying, isPausing, playSeg]);
+
+  useEffect(() => {
+    if (isPlaying && segsRef.current.length > 0) {
+      const seg = segsRef.current[idxRef.current];
+      const ct = playerRef.current.currentTime;
+      playerRef.current.play(Math.max(ct, seg.start), seg.end, speed);
+    }
+  }, [speed]);
+
+  const prog = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const curSeg = sentences[curIdx];
+  const segLen = curSeg ? curSeg.end - curSeg.start : 0;
+  const segProg = curSeg && segLen > 0 ? Math.min(100, Math.max(0, ((currentTime - curSeg.start) / segLen) * 100)) : 0;
+  const activeCount = sentences.length - disabledSet.size;
+
+  const toggleDisabled = useCallback((idx, e) => {
+    e.stopPropagation();
+    setDisabledSet(prev => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  }, []);
+
+  function extractYTId(url) {
+    const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([^&\s?]+)/);
+    return m ? m[1] : null;
+  }
+
+  return (
+    <div style={{ height:"100vh", background:C.bg, color:C.text, fontFamily:"inherit", display:"flex", flexDirection:"column", overflow:"hidden" }}>
+
+      {/* ── Header ── */}
+      <div style={{ background:C.card, borderBottom:`1px solid ${C.border}`, padding:"max(env(safe-area-inset-top),12px) 16px 0", boxShadow:"0 1px 4px rgba(0,0,0,0.06)", flexShrink:0 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
+          <div style={{ width:32, height:32, borderRadius:8, background:C.accent, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>🎧</div>
+          <div>
+            <div style={{ fontSize:16, fontWeight:800, color:C.text, letterSpacing:"-0.02em" }}>Shadowing Lab</div>
+            <div style={{ fontSize:11, color:C.muted }}>영어 쉐도잉 트레이너</div>
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:2 }}>
+          {[["file","📁 파일"],["youtube","▶ YouTube"]].map(([k,l]) => (
+            <button key={k} onClick={() => setTab(k)} style={{
+              background:"none", border:"none",
+              borderBottom:`3px solid ${tab===k?C.accent:"transparent"}`,
+              color: tab===k?C.accent:C.muted,
+              cursor:"pointer", padding:"8px 16px",
+              fontSize:13, fontFamily:"inherit", fontWeight: tab===k?700:400,
+            }}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Scrollable Content ── */}
+      <div style={{ flex:1, overflowY:"auto", WebkitOverflowScrolling:"touch", padding:"16px 16px max(env(safe-area-inset-bottom),16px)" }}>
+        <div style={{ maxWidth:500, margin:"0 auto" }}>
+
+        {/* ── FILE TAB ── */}
+        {tab === "file" && (<>
+
+          {/* Drop zone */}
+          <label
+            onDragOver={e => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={e => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); }}
+            style={{
+              display:"block", border:`2px dashed ${dragging?C.accent:C.border}`,
+              borderRadius:14, padding:"28px 16px", cursor:"pointer", textAlign:"center",
+              marginBottom:14, background: dragging?C.accentLight:C.card,
+              transition:"all 0.2s",
+            }}>
+            <input type="file" accept="audio/*,video/*,.mp3,.aac,.mp4,.m4a,.wav"
+              onChange={e => { handleFile(e.target.files[0]); e.target.value = ""; }} style={{ display:"none" }} />
+            <div style={{ fontSize:36, marginBottom:8 }}>
+              {status==="loading"||status==="analyzing" ? "⏳" : "📂"}
+            </div>
+            <div style={{ fontSize:15, fontWeight:600, color: status==="analyzing"?C.accent:C.text, marginBottom:4 }}>
+              {status==="loading" ? "파일 읽는 중..." :
+               status==="analyzing" ? "무음 구간 분석 중..." :
+               "탭하여 파일 선택"}
+            </div>
+            <div style={{ fontSize:12, color:C.muted }}>MP3 · AAC · MP4 · WAV</div>
+            {fileName && (
+              <div style={{ marginTop:10, display:"inline-flex", alignItems:"center", gap:5, background:C.accentLight, borderRadius:20, padding:"4px 12px" }}>
+                <span style={{ fontSize:13 }}>🎵</span>
+                <span style={{ fontSize:12, color:C.accent, fontWeight:600, maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{fileName}</span>
+              </div>
+            )}
+          </label>
+
+          {/* Error */}
+          {status==="error" && errMsg && (
+            <div style={{ background:"#fef2f2", border:`1px solid #fca5a5`, borderRadius:12, padding:"12px 14px", fontSize:13, color:"#dc2626", marginBottom:14, display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:16 }}>⚠️</span> {errMsg}
+            </div>
+          )}
+
+          {/* Restored toast */}
+          {hasRestoredFile && (
+            <div style={{ background:C.greenLight, border:`1px solid #86efac`, borderRadius:10, padding:"10px 14px", fontSize:13, color:C.green, marginBottom:12, display:"flex", alignItems:"center", gap:8, animation:"fadeIn 0.3s" }}>
+              <span style={{ fontSize:15 }}>✅</span> 이전 진행기록을 복원했습니다
+            </div>
+          )}
+
+          {/* Saved files list (show when idle or no file loaded) */}
+          {savedFiles.length > 0 && status !== "ready" && status !== "loading" && status !== "analyzing" && (
+            <div style={{ background:C.card, borderRadius:12, border:`1px solid ${C.border}`, marginBottom:14, overflow:"hidden" }}>
+              <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.dim}`, fontSize:13, fontWeight:700, color:C.text }}>
+                📂 최근 파일 기록
+              </div>
+              <div style={{ maxHeight:180, overflowY:"auto" }}>
+                {savedFiles.map((f, i) => {
+                  const saved = loadFileProgress(f.name);
+                  const disCount = saved?.disabledIdxs?.length || 0;
+                  const segCount = saved?.segCount || 0;
+                  const progress = segCount > 0 ? Math.round(((saved?.curIdx || 0) + 1) / segCount * 100) : 0;
+                  return (
+                    <div key={f.name} style={{
+                      display:"flex", alignItems:"center", padding:"10px 14px",
+                      borderBottom: i < savedFiles.length - 1 ? `1px solid ${C.dim}` : "none",
+                    }}>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ fontSize:13, fontWeight:600, color:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                          🎵 {f.name}
+                        </div>
+                        <div style={{ fontSize:11, color:C.muted, marginTop:2 }}>
+                          {segCount}개 구간 · {progress}% 진행{disCount > 0 && ` · ${disCount}개 비활성`}
+                        </div>
+                      </div>
+                      <button onClick={() => { removeFileProgress(f.name); setSavedFiles(loadFileList()); }} style={{
+                        width:28, height:28, borderRadius:8, border:`1px solid ${C.border}`,
+                        background:"transparent", color:C.muted, cursor:"pointer",
+                        fontSize:13, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, marginLeft:8,
+                      }}>✕</button>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ padding:"8px 14px", borderTop:`1px solid ${C.dim}`, fontSize:11, color:C.muted, textAlign:"center" }}>
+                같은 파일을 다시 열면 기록이 자동 복원됩니다
+              </div>
+            </div>
+          )}
+
+          {/* ── PLAYER ── */}
+          {status==="ready" && sentences.length>0 && (<>
+
+            {/* Stats bar */}
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 14px", background:C.card, borderRadius:10, marginBottom:10, fontSize:13, border:`1px solid ${C.border}` }}>
+              <span style={{ color:C.muted }}>총 <b style={{ color:C.text }}>{sentences.length}</b>개{disabledSet.size > 0 && <span> · <b style={{ color:C.green }}>{activeCount}</b> 활성</span>} · {fmtTime(duration)}</span>
+              <span style={{ color:C.accent, fontWeight:700, fontSize:15 }}>{curIdx+1}/{sentences.length}</span>
+            </div>
+
+            {/* Global progress */}
+            <div style={{ height:6, background:C.dim, borderRadius:99, marginBottom:4, cursor:"pointer" }}
+              onClick={e => {
+                const r = e.currentTarget.getBoundingClientRect();
+                const t = ((e.clientX-r.left)/r.width)*duration;
+                playerRef.current.seek(t); setCurrentTime(t);
+              }}>
+              <div style={{ height:"100%", width:`${prog}%`, background:`linear-gradient(90deg,${C.accent},${C.accent2})`, borderRadius:99, transition:"width 0.1s" }} />
+            </div>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.muted, marginBottom:4, padding:"0 2px" }}>
+              <span>{fmtTime(currentTime)}</span>
+              <span>{fmtTime(duration)}</span>
+            </div>
+
+            {/* Segment minimap */}
+            <div style={{ height:24, background:C.card, borderRadius:8, marginBottom:14, position:"relative", overflow:"hidden", cursor:"pointer", border:`1px solid ${C.border}` }}
+              onClick={e => {
+                const r = e.currentTarget.getBoundingClientRect();
+                const p = (e.clientX-r.left)/r.width;
+                const t = p*duration;
+                const idx = sentences.findIndex((s,i) => { const nx=sentences[i+1]; return t>=s.start&&(nx?t<nx.start:true); });
+                if (idx>=0) playSeg(idx);
+              }}>
+              {sentences.map((seg,i) => (
+                <div key={i} style={{
+                  position:"absolute", top:3, bottom:3,
+                  left:`${(seg.start/duration)*100}%`,
+                  width:`${Math.max(0.5,((seg.end-seg.start)/duration)*100)}%`,
+                  background: disabledSet.has(i)?"#e8e4df": i===curIdx?C.accent:"#d1c9be",
+                  borderRadius:2,
+                  opacity: disabledSet.has(i)?0.4:1,
+                  transition:"background 0.2s, opacity 0.2s",
+                }} />
+              ))}
+              <div style={{ position:"absolute", top:0, bottom:0, left:`${prog}%`, width:2, background:C.accent2, borderRadius:99, pointerEvents:"none" }} />
+            </div>
+
+            {/* ── Main Player Card ── */}
+            <div style={{ background:C.card, borderRadius:16, padding:"16px", marginBottom:14, border:`1px solid ${C.border}`, boxShadow:"0 2px 12px rgba(0,0,0,0.07)" }}>
+
+              {/* Segment info */}
+              <div style={{ textAlign:"center", marginBottom:14 }}>
+                <div style={{ fontSize:42, fontWeight:900, color:C.accent, lineHeight:1, letterSpacing:"-0.03em" }}>
+                  {String(curIdx+1).padStart(2,"0")}
+                </div>
+                <div style={{ fontSize:13, color:C.muted, marginTop:4 }}>
+                  {fmtTime(curSeg?.start)} → {fmtTime(curSeg?.end)}
+                  <span style={{ margin:"0 6px", color:C.border }}>·</span>
+                  {segLen.toFixed(1)}초
+                </div>
+                {isLooping && repeatRem>0 && (
+                  <div style={{ marginTop:6, display:"inline-flex", alignItems:"center", gap:5, background:C.accentLight, borderRadius:20, padding:"3px 12px" }}>
+                    <span style={{ fontSize:13 }}>🔁</span>
+                    <span style={{ fontSize:12, color:C.accent, fontWeight:700 }}>{repeatRem}/{repeatCount}회</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Segment progress */}
+              <div style={{ height:6, background:C.dim, borderRadius:99, marginBottom:16, overflow:"hidden" }}>
+                <div style={{ height:"100%", width:`${segProg}%`, background:C.accent2, borderRadius:99, transition:"width 0.05s" }} />
+              </div>
+
+              {/* Playback controls */}
+              <div style={{ display:"flex", justifyContent:"center", alignItems:"center", gap:10, marginBottom:16 }}>
+                <CtrlBtn onClick={() => playSeg(0)} size={42}>⏮</CtrlBtn>
+                <CtrlBtn onClick={() => curIdx>0&&playSeg(curIdx-1)} size={42}>◁</CtrlBtn>
+                <CtrlBtn onClick={togglePlay} size={60} primary>{isPausing?"⏳":isPlaying?"⏸":"▶"}</CtrlBtn>
+                <CtrlBtn onClick={() => curIdx<sentences.length-1&&playSeg(curIdx+1)} size={42}>▷</CtrlBtn>
+                <CtrlBtn onClick={() => playSeg(sentences.length-1)} size={42}>⏭</CtrlBtn>
+              </div>
+
+              {/* Loop controls */}
+              <div style={{ padding:"10px 0 4px", borderTop:`1px solid ${C.dim}` }}>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:600, marginBottom:6 }}>반복 설정</div>
+                <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                  <Tag active={isLooping} color={C.accent} onClick={() => setIsLooping(v=>!v)}>
+                    🔁 {isLooping?"ON":"OFF"}
+                  </Tag>
+                  {isLooping && [1,2,3,5,10].map(n => (
+                    <Tag key={n} active={repeatCount===n} color={C.accent2} onClick={() => setRepeatCount(n)}>{n}회</Tag>
+                  ))}
+                </div>
+              </div>
+
+              {/* Pause between repeats */}
+              <div style={{ padding:"10px 0 4px", borderTop:`1px solid ${C.dim}`, marginTop:10 }}>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:600, marginBottom:6 }}>쉬는 시간</div>
+                <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                  {[0, 1, 2, 3, 5].map(d => (
+                    <Tag key={d} active={pauseDur===d} color={C.green} onClick={() => setPauseDur(d)}>
+                      {d === 0 ? "없음" : `${d}초`}
+                    </Tag>
+                  ))}
+                </div>
+                {isPausing && (
+                  <div style={{ marginTop:6, display:"inline-flex", alignItems:"center", gap:5, background:C.greenLight, borderRadius:20, padding:"3px 12px" }}>
+                    <span style={{ fontSize:13 }}>⏳</span>
+                    <span style={{ fontSize:12, color:C.green, fontWeight:700 }}>쉬는 중... {pauseDur}초</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Speed controls */}
+              <div style={{ padding:"10px 0 0", borderTop:`1px solid ${C.dim}`, marginTop:10 }}>
+                <div style={{ fontSize:12, color:C.muted, fontWeight:600, marginBottom:6 }}>재생 속도</div>
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                  {SPEEDS.map(s => (
+                    <Tag key={s} active={speed===s} color={C.accent} onClick={() => setSpeed(s)}>{s}x</Tag>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* ── Sentence List ── */}
+            <div style={{ background:C.card, borderRadius:14, overflow:"hidden", border:`1px solid ${C.border}` }}>
+              <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.dim}`, fontSize:13, fontWeight:700, color:C.text, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <span>📋 구간 목록</span>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  <span style={{ fontSize:11, fontWeight:600, color: disabledSet.size>0?C.accent:C.muted }}>
+                    {sentences.length>0 ? Math.round((disabledSet.size/sentences.length)*100) : 0}% 비활성
+                  </span>
+                  {disabledSet.size > 0 && (
+                    <button onClick={() => { setDisabledSet(new Set()); disabledRef.current = new Set(); }} style={{
+                      background:C.greenLight, border:`1px solid #86efac`, borderRadius:6,
+                      color:C.green, cursor:"pointer", padding:"3px 10px",
+                      fontFamily:"inherit", fontSize:11, fontWeight:700,
+                    }}>전체 복원</button>
+                  )}
+                </div>
+              </div>
+              <div ref={sentListRef} style={{ maxHeight:240, overflowY:"auto", WebkitOverflowScrolling:"touch" }}>
+                {sentences.map((seg,i) => {
+                  const disabled = disabledSet.has(i);
+                  return (
+                  <div key={i} onClick={() => playSeg(i)} style={{
+                    display:"flex", alignItems:"center", padding:"10px 14px",
+                    cursor:"pointer",
+                    background: disabled?"transparent": i===curIdx?C.accentLight:"transparent",
+                    borderBottom:`1px solid ${C.dim}`,
+                    opacity: disabled?0.38:1,
+                    transition:"background 0.15s, opacity 0.2s",
+                  }}>
+                    <div style={{
+                      width:30, height:30, borderRadius:"50%", flexShrink:0, marginRight:12,
+                      background: disabled?C.dim: i===curIdx?C.accent:C.dim,
+                      color: disabled?C.border: i===curIdx?"#fff":C.muted,
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      fontSize:12, fontWeight:700,
+                    }}>{disabled?"–": i===curIdx&&isPlaying?"▶":i+1}</div>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:13, fontWeight: !disabled&&i===curIdx?700:400, color: disabled?C.muted: i===curIdx?C.accent:C.text, textDecoration: disabled?"line-through":"none" }}>
+                        {fmtTime(seg.start)} → {fmtTime(seg.end)}
+                      </div>
+                      <div style={{ fontSize:11, color:C.muted, marginTop:1 }}>{(seg.end-seg.start).toFixed(1)}초</div>
+                    </div>
+                    <button onClick={(e) => toggleDisabled(i, e)} style={{
+                      width:32, height:32, borderRadius:8, border:`1px solid ${disabled?"#86efac":C.border}`,
+                      background: disabled?C.greenLight:"transparent",
+                      color: disabled?C.green:C.muted,
+                      cursor:"pointer", fontSize:14, fontWeight:700,
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      flexShrink:0, marginLeft:8,
+                    }}>{disabled?"↩":"✕"}</button>
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+          </>)}
+
+          {/* Settings */}
+          <button onClick={() => setShowSettings(v=>!v)} style={{
+            width:"100%", background:C.card, border:`1px solid ${C.border}`, borderRadius:10,
+            color:C.muted, cursor:"pointer", padding:"10px", fontFamily:"inherit",
+            fontSize:13, marginTop:12, display:"flex", alignItems:"center", justifyContent:"center", gap:6,
+          }}>
+            <span>⚙️</span>
+            <span>{showSettings?"설정 닫기":"무음 감지 설정"}</span>
+            <span style={{ marginLeft:"auto" }}>{showSettings?"▲":"▼"}</span>
+          </button>
+
+          {showSettings && (
+            <div style={{ background:C.card, borderRadius:10, padding:"14px", marginTop:6, border:`1px solid ${C.border}` }}>
+              <SliderRow label="무음 감지 임계값" sub="높이면 더 많이 분리"
+                value={threshold} min={0.003} max={0.1} step={0.002}
+                onChange={setThreshold} fmt={v=>v.toFixed(3)} />
+              <SliderRow label="최소 무음 길이" sub="짧을수록 더 자주 분리"
+                value={minSilDur} min={0.1} max={2.0} step={0.05}
+                onChange={setMinSilDur} fmt={v=>v.toFixed(2)+"초"} />
+              {audioBufRef.current && (
+                <button onClick={reAnalyze} style={{
+                  width:"100%", background:C.accentLight, border:`1.5px solid ${C.accent}`,
+                  borderRadius:8, color:C.accent, cursor:"pointer", padding:"10px",
+                  fontFamily:"inherit", fontSize:13, fontWeight:700, marginTop:4,
+                }}>↻ 재분석</button>
+              )}
+            </div>
+          )}
+        </>)}
+
+        {/* ── YOUTUBE TAB ── */}
+        {tab === "youtube" && (
+          <div>
+            <div style={{ background:"#fffbeb", border:`1px solid #fcd34d`, borderRadius:12, padding:"14px", marginBottom:12 }}>
+              <div style={{ fontSize:14, color:"#92400e", fontWeight:700, marginBottom:6 }}>⚠️ YouTube 사용 제한</div>
+              <div style={{ fontSize:12, color:"#78350f", lineHeight:1.8 }}>
+                • CORS 정책상 오디오 직접 분석 불가<br/>
+                • <b>무음 감지 · 문장 분리 불가</b>
+              </div>
+            </div>
+            <div style={{ background:C.greenLight, border:`1px solid #86efac`, borderRadius:12, padding:"14px", marginBottom:12 }}>
+              <div style={{ fontSize:14, color:C.green, fontWeight:700, marginBottom:8 }}>✅ 권장: 파일로 변환 후 업로드</div>
+              <div style={{ fontSize:12, color:"#14532d", lineHeight:1.8 }}>
+                <b>cobalt.tools</b> 접속 → URL 붙여넣기 → MP3 다운<br/>
+                <a href="https://cobalt.tools" target="_blank" rel="noreferrer"
+                  style={{ color:C.green, fontWeight:700 }}>→ cobalt.tools 열기</a>
+              </div>
+              <button onClick={() => setTab("file")} style={{
+                width:"100%", marginTop:10, background:C.green, color:"#fff", border:"none",
+                borderRadius:8, padding:"10px", cursor:"pointer", fontFamily:"inherit",
+                fontSize:13, fontWeight:700,
+              }}>📁 파일 업로드로 이동</button>
+            </div>
+            <div style={{ fontSize:12, color:C.muted, marginBottom:6 }}>임베드 미리보기:</div>
+            <div style={{ display:"flex", gap:6, marginBottom:8 }}>
+              <input value={ytInput} onChange={e => setYtInput(e.target.value)}
+                onKeyDown={e => e.key==="Enter" && setYtId(extractYTId(ytInput)||"")}
+                placeholder="https://youtu.be/..."
+                style={{ flex:1, background:C.card, border:`1.5px solid ${C.border}`, borderRadius:8, padding:"10px 12px", color:C.text, fontFamily:"inherit", fontSize:13, outline:"none" }} />
+              <button onClick={() => setYtId(extractYTId(ytInput)||"")} style={{
+                background:C.accent, color:"#fff", border:"none", borderRadius:8,
+                padding:"0 16px", cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:700,
+              }}>로드</button>
+            </div>
+            {ytId && (
+              <>
+                <iframe src={`https://www.youtube.com/embed/${ytId}`}
+                  style={{ width:"100%", height:200, borderRadius:10, border:`1px solid ${C.border}` }}
+                  allow="autoplay; encrypted-media" allowFullScreen />
+                <div style={{ display:"flex", gap:6, marginTop:6 }}>
+                  <a href={`https://www.youtube.com/watch?v=${ytId}`} target="_blank" rel="noreferrer"
+                    style={{ flex:1, textAlign:"center", background:C.card, border:`1px solid ${C.border}`, borderRadius:8, padding:"8px", color:C.muted, fontSize:12, textDecoration:"none", fontWeight:600 }}>↗ YouTube</a>
+                  <a href="https://cobalt.tools" target="_blank" rel="noreferrer"
+                    style={{ flex:1, textAlign:"center", background:C.greenLight, border:`1px solid #86efac`, borderRadius:8, padding:"8px", color:C.green, fontSize:12, textDecoration:"none", fontWeight:600 }}>↓ 다운로드</a>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        <div style={{ textAlign:"center", fontSize:11, color:C.muted, marginTop:20, marginBottom:8 }}>
+          Shadowing Lab · Web Audio API
+        </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CtrlBtn({ children, onClick, size=42, primary }) {
+  return (
+    <button onClick={onClick} style={{
+      width:size, height:size, borderRadius: size>=60?50:10,
+      background: primary?C.accent:C.dim,
+      border:`1.5px solid ${primary?"transparent":C.border}`,
+      color: primary?"#fff":C.text,
+      cursor:"pointer", fontSize: size>=60?24:16,
+      display:"inline-flex", alignItems:"center", justifyContent:"center",
+      flexShrink:0, fontFamily:"inherit",
+      boxShadow: primary?"0 4px 14px rgba(232,80,10,0.3)":"none",
+    }}>{children}</button>
+  );
+}
+
+function Tag({ children, onClick, active, color }) {
+  return (
+    <button onClick={onClick} style={{
+      background: active?color+"18":"transparent",
+      border:`1.5px solid ${active?color:C.border}`,
+      borderRadius:18, color: active?color:C.muted,
+      cursor:"pointer", padding:"4px 12px",
+      fontFamily:"inherit", fontSize:12, fontWeight: active?700:400,
+    }}>{children}</button>
+  );
+}
+
+function SliderRow({ label, sub, value, min, max, step, onChange, fmt }) {
+  return (
+    <div style={{ marginBottom:16 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, marginBottom:4 }}>
+        <div>
+          <div style={{ color:C.text, fontWeight:600 }}>{label}</div>
+          {sub && <div style={{ fontSize:11, color:C.muted, marginTop:1 }}>{sub}</div>}
+        </div>
+        <span style={{ color:C.accent, fontWeight:700, fontSize:14 }}>{fmt(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{ width:"100%", accentColor:C.accent, cursor:"pointer", height:6 }} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
