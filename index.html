@@ -174,10 +174,20 @@ const STORE_GLOBAL = STORE_PREFIX + "global";
 const STORE_FILES = STORE_PREFIX + "files"; // list of known filenames
 
 function saveGlobal(data) {
-  try { localStorage.setItem(STORE_GLOBAL, JSON.stringify(data)); } catch(_) {}
+  try {
+    const d = {...data};
+    if (d.repeatCount === Infinity) d.repeatCount = "inf";
+    localStorage.setItem(STORE_GLOBAL, JSON.stringify(d));
+  } catch(_) {}
 }
 function loadGlobal() {
-  try { const d = localStorage.getItem(STORE_GLOBAL); return d ? JSON.parse(d) : null; } catch(_) { return null; }
+  try {
+    const d = localStorage.getItem(STORE_GLOBAL);
+    if (!d) return null;
+    const parsed = JSON.parse(d);
+    if (parsed.repeatCount === "inf") parsed.repeatCount = Infinity;
+    return parsed;
+  } catch(_) { return null; }
 }
 function fileKey(name) { return STORE_PREFIX + "f_" + name; }
 function saveFileProgress(name, data) {
@@ -427,12 +437,23 @@ function App() {
 
   const toggleDisabled = useCallback((idx, e) => {
     e.stopPropagation();
+    const wasDisabled = disabledSet.has(idx);
     setDisabledSet(prev => {
       const next = new Set(prev);
       if (next.has(idx)) next.delete(idx); else next.add(idx);
       return next;
     });
-  }, []);
+    // If disabling the current segment, auto-advance to next enabled
+    if (!wasDisabled && idx === idxRef.current) {
+      const segs = segsRef.current;
+      // Find next enabled (skip idx we just disabled)
+      for (let i = idx + 1; i < segs.length; i++) {
+        if (!disabledSet.has(i)) { playSeg(i); return; }
+      }
+      // Nothing after → stop
+      playerRef.current.stopSource(); setIsPlaying(false);
+    }
+  }, [disabledSet, playSeg]);
 
   function extractYTId(url) {
     const m = url.match(/(?:v=|youtu\.be\/|shorts\/)([^&\s?]+)/);
@@ -617,7 +638,7 @@ function App() {
                 {isLooping && repeatRem>0 && (
                   <div style={{ marginTop:6, display:"inline-flex", alignItems:"center", gap:5, background:C.accentLight, borderRadius:20, padding:"3px 12px" }}>
                     <span style={{ fontSize:13 }}>🔁</span>
-                    <span style={{ fontSize:12, color:C.accent, fontWeight:700 }}>{repeatRem}/{repeatCount}회</span>
+                    <span style={{ fontSize:12, color:C.accent, fontWeight:700 }}>{repeatCount===Infinity?"∞ 반복 중":`${repeatRem}/${repeatCount}회`}</span>
                   </div>
                 )}
               </div>
@@ -643,8 +664,8 @@ function App() {
                   <Tag active={isLooping} color={C.accent} onClick={() => setIsLooping(v=>!v)}>
                     🔁 {isLooping?"ON":"OFF"}
                   </Tag>
-                  {isLooping && [1,2,3,5,10].map(n => (
-                    <Tag key={n} active={repeatCount===n} color={C.accent2} onClick={() => setRepeatCount(n)}>{n}회</Tag>
+                  {isLooping && [1,2,3,5,10,Infinity].map(n => (
+                    <Tag key={n} active={repeatCount===n} color={C.accent2} onClick={() => setRepeatCount(n)}>{n===Infinity?"∞":n+"회"}</Tag>
                   ))}
                 </div>
               </div>
