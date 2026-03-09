@@ -100,61 +100,38 @@ const C = {
 
 class AudioPlayer {
   constructor() {
-    this.ctx = null; this.source = null; this.gainNode = null;
-    this.buffer = null; this.startedAt = 0; this.offsetAt = 0;
-    this.speed = 1.0; this.playing = false;
-    this.onTimeUpdate = null; this.rafId = null;
-    this.segEnd = null; this.onSegEnd = null;
+    this.audio = new Audio();
+    this.audio.preload = "auto";
+    this.playing = false;
+    this.segEnd = null;
+    this.onTimeUpdate = null;
+    this.onSegEnd = null;
+    this.rafId = null;
   }
-  async ensureCtx() {
-    if (!this.ctx) {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      this.gainNode = this.ctx.createGain();
-      this.gainNode.connect(this.ctx.destination);
-    }
-    if (this.ctx.state === "suspended") await this.ctx.resume();
-  }
-  get currentTime() {
-    if (!this.playing || !this.ctx) return this.offsetAt;
-    return this.offsetAt + (this.ctx.currentTime - this.startedAt) * this.speed;
-  }
-  get duration() { return this.buffer ? this.buffer.duration : 0; }
+  get currentTime() { return this.audio.currentTime || 0; }
+  get duration() { return this.audio.duration || 0; }
   stopSource() {
     this.playing = false;
     if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
-    if (this.source) {
-      this.source.onended = null;
-      try { this.source.stop(); } catch (_) {}
-      this.source.disconnect();
-      this.source = null;
-    }
+    this.audio.pause();
+    this.audio.onended = null;
   }
   async play(offset, segEnd, speed = 1.0) {
-    await this.ensureCtx(); this.stopSource();
-    if (!this.buffer) return;
-    const safeOffset = Math.max(0, Math.min(offset, this.buffer.duration - 0.01));
-    this.offsetAt = safeOffset; this.startedAt = this.ctx.currentTime;
-    this.speed = speed; this.segEnd = segEnd;
-    const src = this.ctx.createBufferSource();
-    src.buffer = this.buffer; src.playbackRate.value = speed;
-    src.connect(this.gainNode);
-    src.start(0, safeOffset, (this.buffer.duration - safeOffset) / speed);
-    this.source = src; this.playing = true;
-    src.onended = () => { if (this.playing) { this.playing = false; if (this.onSegEnd) this.onSegEnd("ended"); } };
+    this.stopSource();
+    this.audio.playbackRate = speed;
+    this.audio.currentTime = Math.max(0, Math.min(offset, this.duration - 0.01));
+    this.segEnd = segEnd;
+    try { await this.audio.play(); } catch(_) {}
+    this.playing = true;
+    this.audio.onended = () => {
+      if (this.playing) { this.playing = false; if (this.onSegEnd) this.onSegEnd("ended"); }
+    };
     const tick = () => {
       if (!this.playing) return;
-      const ct = this.currentTime;
+      const ct = this.audio.currentTime;
       if (this.onTimeUpdate) this.onTimeUpdate(ct);
       if (this.segEnd !== null && ct >= this.segEnd - 0.06) {
-        this.playing = false;
-        if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
-        if (this.source) {
-          this.source.onended = null;
-          try { this.source.stop(); } catch (_) {}
-          this.source.disconnect();
-          this.source = null;
-        }
-        this.offsetAt = this.segEnd;
+        this.stopSource();
         if (this.onSegEnd) this.onSegEnd("segend");
         return;
       }
@@ -162,9 +139,10 @@ class AudioPlayer {
     };
     this.rafId = requestAnimationFrame(tick);
   }
-  pause() { if (!this.playing) return; this.offsetAt = this.currentTime; this.stopSource(); }
-  seek(t) { this.offsetAt = Math.max(0, Math.min(t, this.duration)); }
-  setBuffer(buf) { this.stopSource(); this.buffer = buf; this.offsetAt = 0; }
+  pause() { if (!this.playing) return; this.stopSource(); }
+  seek(t) { if (this.audio.readyState > 0) this.audio.currentTime = Math.max(0, Math.min(t, this.duration)); }
+  setSource(url) { this.stopSource(); this.audio.src = url; }
+  ensureCtx() {} // no-op, kept for compat
 }
 
 // ── LocalStorage helpers ──
@@ -245,6 +223,7 @@ function App() {
   const pauseTimerRef = useRef(null);
   const disabledRef = useRef(new Set());
   const fileNameRef = useRef("");
+  const blobUrlRef = useRef(null);
 
   useEffect(() => { segsRef.current = sentences; }, [sentences]);
   useEffect(() => { idxRef.current = curIdx; }, [curIdx]);
@@ -338,19 +317,50 @@ function App() {
     setIsPausing(false);
     if (pauseTimerRef.current) { clearTimeout(pauseTimerRef.current); pauseTimerRef.current = null; }
     playerRef.current.stopSource();
+    // Clean up old blob URL
+    if (blobUrlRef.current) { URL.revokeObjectURL(blobUrlRef.current); }
     try {
-      await playerRef.current.ensureCtx();
-      const ctx = playerRef.current.ctx;
+      // 1. Set up streaming playback via blob URL
+      const blobUrl = URL.createObjectURL(file);
+      blobUrlRef.current = blobUrl;
+      playerRef.current.setSource(blobUrl);
+      // Wait for audio metadata to get duration
+      const dur = await new Promise((resolve, reject) => {
+        const a = playerRef.current.audio;
+        const onMeta = () => { a.removeEventListener("loadedmetadata", onMeta); a.removeEventListener("error", onErr); resolve(a.duration); };
+        const onErr = () => { a.removeEventListener("loadedmetadata", onMeta); a.removeEventListener("error", onErr); reject(new Error("오디오 로드 실패")); };
+        if (a.readyState >= 1) return resolve(a.duration);
+        a.addEventListener("loadedmetadata", onMeta);
+        a.addEventListener("error", onErr);
+      });
+      setDuration(dur);
       setStatus("analyzing");
+      // 2. Decode at low sample rate (8kHz mono) for analysis — uses ~10x less memory
       const arrayBuf = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = e => resolve(e.target.result);
         reader.onerror = () => reject(new Error("파일 읽기 실패"));
         reader.readAsArrayBuffer(file);
       });
-      const buf = await ctx.decodeAudioData(arrayBuf);
-      audioBufRef.current = buf; playerRef.current.setBuffer(buf);
-      setDuration(buf.duration); runAnalysis(buf, threshold, minSilDur, file.name);
+      let analysisBuf;
+      const ANALYSIS_SR = 8000;
+      try {
+        // Low-res decode for memory efficiency
+        const OffCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+        if (OffCtx && dur > 0 && isFinite(dur)) {
+          const offCtx = new OffCtx(1, Math.ceil(dur * ANALYSIS_SR), ANALYSIS_SR);
+          analysisBuf = await offCtx.decodeAudioData(arrayBuf.slice(0));
+        } else { throw new Error("fallback"); }
+      } catch(_) {
+        // Fallback: decode at native sample rate
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioCtx();
+        analysisBuf = await ctx.decodeAudioData(arrayBuf);
+        ctx.close();
+      }
+      // arrayBuf is now GC-able
+      audioBufRef.current = analysisBuf; // small: 8kHz mono
+      runAnalysis(analysisBuf, threshold, minSilDur, file.name);
     } catch (err) {
       setStatus("error"); setErrMsg("파일 분석 실패: " + (err.message || "지원하지 않는 형식"));
     }
@@ -381,10 +391,8 @@ function App() {
   }, [isPlaying, isPausing, playSeg]);
 
   useEffect(() => {
-    if (isPlaying && segsRef.current.length > 0) {
-      const seg = segsRef.current[idxRef.current];
-      const ct = playerRef.current.currentTime;
-      playerRef.current.play(Math.max(ct, seg.start), seg.end, speed);
+    if (isPlaying) {
+      playerRef.current.audio.playbackRate = speed;
     }
   }, [speed]);
 
@@ -452,7 +460,7 @@ function App() {
               transition:"all 0.2s",
             }}>
             <input type="file" accept="audio/*,video/*,.mp3,.aac,.mp4,.m4a,.wav"
-              onChange={e => handleFile(e.target.files[0])} style={{ display:"none" }} />
+              onChange={e => { handleFile(e.target.files[0]); e.target.value = ""; }} style={{ display:"none" }} />
             <div style={{ fontSize:36, marginBottom:8 }}>
               {status==="loading"||status==="analyzing" ? "⏳" : "📂"}
             </div>
